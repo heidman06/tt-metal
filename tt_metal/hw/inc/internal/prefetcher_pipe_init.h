@@ -75,6 +75,11 @@ FORCE_INLINE void setup_prefetcher_pipe_interface(
 // (durable receiver rd cursor) + this-launch entry_size. Local snap only — same
 // address math as receiver resize without credit fixup.
 //
+// The relay's own page size is preserved, not overwritten with the pipe entry: a relay may be
+// finer-grained than delivery (a tile-paged circular buffer under a K-block entry), and the
+// compute-side unpacker addresses tiles at that page stride. Only the ring extent and the cursor
+// come from the pipe. entry == page — the DataflowBuffer relay case — is unchanged.
+//
 // Called from align_local_dfb_to_prefetcher_pipe_slot.
 // Not a public compute API (TRISC kernels consume via DataflowBuffer /
 // RelayDFBBindingToken after this snap).
@@ -100,12 +105,12 @@ FORCE_INLINE void align_local_dfb_to_prefetcher_pipe_checkpoint(
     const uint32_t fifo_limit = fifo_limit_page_aligned >> cb_addr_shift;
     const uint32_t fifo_size_units = fifo_limit - (fifo_start_addr >> cb_addr_shift);
     const uint32_t fifo_ptr_units = next_fifo_rd_ptr >> cb_addr_shift;
-    const uint32_t page_size_units = entry_size >> cb_addr_shift;
+    const uint32_t page_size_units = local.fifo_page_size;
     ASSERT(page_size_units != 0);
     ASSERT(fifo_size_units % page_size_units == 0);
+    ASSERT((entry_size >> cb_addr_shift) % page_size_units == 0);
     local.fifo_limit = fifo_limit;
     local.fifo_size = fifo_size_units;
-    local.fifo_page_size = page_size_units;
     local.fifo_num_pages = fifo_size_units / page_size_units;
     local.fifo_wr_ptr = fifo_ptr_units;
     local.fifo_rd_ptr = fifo_ptr_units;
@@ -138,21 +143,24 @@ FORCE_INLINE void align_local_dfb_to_prefetcher_pipe_slot(uint32_t relay_dfb_id,
 #if defined(KERNEL_BUILD) && !defined(COMPILE_FOR_TRISC)
 
 // Align DM's private local relay-DFB iface to the PrefetcherPipe receiver's
-// rd_ptr / page size / limit. Called from PrefetcherPipe::bind_relay() and from
+// rd_ptr / ring extent. Called from PrefetcherPipe::bind_relay() and from
 // set_receiver_entry_size() so a mid-kernel page-size change does not leave the
-// local CB on the old stride. No NOC — copies from the receiver iface.
+// local CB on the old ring. No NOC — copies from the receiver iface.
+//
+// The relay keeps its own page size (see the checkpoint helper above): the pipe entry only has to
+// be a whole multiple of it.
 FORCE_INLINE void align_local_dfb_to_prefetcher_pipe_receiver_iface(
     uint32_t relay_dfb_id, const CrossNodeReceiverDFBInterface& iface) {
     LocalCBInterface& local = get_local_cb_interface(relay_dfb_id);
     const uint32_t fifo_limit = iface.fifo_limit_page_aligned >> cb_addr_shift;
     const uint32_t fifo_size_units = fifo_limit - (iface.fifo_start_addr >> cb_addr_shift);
     const uint32_t fifo_ptr_units = iface.fifo_rd_ptr >> cb_addr_shift;
-    const uint32_t page_size_units = iface.fifo_page_size >> cb_addr_shift;
+    const uint32_t page_size_units = local.fifo_page_size;
     ASSERT(page_size_units != 0);
     ASSERT(fifo_size_units % page_size_units == 0);
+    ASSERT((iface.fifo_page_size >> cb_addr_shift) % page_size_units == 0);
     local.fifo_limit = fifo_limit;
     local.fifo_size = fifo_size_units;
-    local.fifo_page_size = page_size_units;
     local.fifo_num_pages = fifo_size_units / page_size_units;
     local.fifo_wr_ptr = fifo_ptr_units;
     local.fifo_rd_ptr = fifo_ptr_units;

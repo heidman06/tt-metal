@@ -41,6 +41,19 @@ namespace ttnn::operations::experimental {
 // or the prefetcher may still deliver into them -- an attached Program holds a non-owning pointer
 // to each pipe, and dropping the last copy frees the rings and config pages.
 struct TensorPrefetcherPipes {
+    // Declared rather than aggregate-implicit so this type is not an aggregate. tt_stl's json
+    // serializer has two unconstrained-against-each-other specializations -- one keyed on
+    // attribute_names, one on being an aggregate -- and a type satisfying both is an ambiguous
+    // partial specialization. Staying a non-aggregate leaves only the attribute_names one, which
+    // is also the only one that can work here: the aggregate walk would descend into `banks` and
+    // the forward-declared PrefetcherPipe.
+    TensorPrefetcherPipes() = default;
+    TensorPrefetcherPipes(
+        std::vector<tt::tt_metal::experimental::TensorPrefetcherBankPipes> banks,
+        uint32_t entry_size,
+        uint32_t num_entries) :
+        banks(std::move(banks)), entry_size(entry_size), num_entries(num_entries) {}
+
     std::vector<tt::tt_metal::experimental::TensorPrefetcherBankPipes> banks;
     // Per-receiver push granularity, shared by every pipe. Every Attach and every queued tensor
     // must match it: a DRAM sender is never dispatched to and so cannot answer a resize.
@@ -62,6 +75,18 @@ struct TensorPrefetcherPipes {
     // the one pipe it belongs to (as a runtime argument, since one kernel serves receivers of
     // different pipes).
     std::vector<uint8_t> attach(tt::tt_metal::Program& program) const;
+    // Each pipe's receiver-side config page address, bank-major. Identity rather than geometry:
+    // two live pipes over the same receivers never share one.
+    std::vector<uint32_t> config_addresses() const;
+
+    // Reflection for op attribute hashing. The core mapping plus the config addresses identify
+    // *these* pipes, not merely pipes of this shape -- a consuming op bakes each ring address into
+    // its program, so a same-geometry replacement must not hit that op's program cache.
+    static constexpr auto attribute_names =
+        std::forward_as_tuple("sender_receiver_core_mapping", "config_addresses", "entry_size", "num_entries");
+    auto attribute_values() const {
+        return std::make_tuple(sender_receiver_core_mapping(), config_addresses(), entry_size, num_entries);
+    }
 };
 
 // One tensor to prefetch: either (tensor, block_count) or (tensor, block_count, rotation).

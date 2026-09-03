@@ -221,8 +221,9 @@ public:
     // Change the size of subsequent receiver operations after this receiver has
     // consumed its E1 entries. Consume the sender's matching pad credits, without
     // requiring the sender's newer E2 payload to drain.
-    // If this core has a relay, also rewrite the local relay DFB iface (page size,
-    // usable limit, rd/wr) so a RelayView from bind_relay() is not left on E1.
+    // If this core has a relay, also rewrite the local relay DFB iface (usable limit, rd/wr, and
+    // the pages an entry covers) so a RelayView from bind_relay() is not left on E1. The relay's
+    // own page size is not touched: it may be finer than the entry.
     // TRISC must already have consumed the previous-size tiles (relay-backed pop_front);
     // its local CB is a separate object aligned at DataflowBuffer construction.
     FORCE_INLINE void set_receiver_entry_size(uint32_t entry_size) {
@@ -235,6 +236,8 @@ public:
         const CrossNodeReceiverDFBInterface& iface = interface_.receiver;
         if (iface.relay_id != RELAY_DFB_INVALID) {
             align_local_dfb_to_prefetcher_pipe_receiver_iface(iface.relay_id, iface);
+            // The relay keeps its page size across the resize, so the pages an entry covers moved.
+            relay_pages_per_entry_ = relay_pages_per_entry(iface);
         }
     }
 #endif
@@ -466,7 +469,10 @@ public:
         CrossNodeReceiverDFBInterface& iface = interface_.receiver;
         const uint32_t entry_size = iface.fifo_page_size;
         const uint32_t payload_bytes = num_entries * entry_size;
-        ASSERT(iface.fifo_rd_ptr + payload_bytes <= iface.fifo_limit_page_aligned);
+        // A read window may straddle the wrap (the caller keeps a lookahead over the ring end);
+        // only asking for more than the ring holds is a bug. units_for_read is already wrap-aware,
+        // and the GlobalCB twin (remote_cb_wait_front) allows the same straddle.
+        ASSERT(payload_bytes <= iface.fifo_limit_page_aligned - iface.fifo_start_addr);
         const uint32_t rd_offset = iface.fifo_rd_ptr - iface.fifo_start_addr;
         const uint32_t units_needed = units_for_read(iface, rd_offset, payload_bytes);
 
@@ -544,6 +550,7 @@ public:
         ASSERT(iface.relay_id != RELAY_DFB_INVALID);
         ASSERT(relay_dfb_ == nullptr);
         align_local_dfb_to_prefetcher_pipe_receiver_iface(iface.relay_id, iface);
+        relay_pages_per_entry_ = relay_pages_per_entry(iface);
         relay_dfb_ = new (relay_dfb_storage_) DataflowBuffer(RelayDFBBindingToken{iface.relay_id});
         const uintptr_t entries_acked_ptr = reinterpret_cast<uintptr_t>(get_cb_tiles_acked_ptr(iface.relay_id));
         relay_entries_acked_checkpoint_ = static_cast<uint16_t>(reg_read(entries_acked_ptr));
@@ -559,9 +566,25 @@ private:
     DataflowBuffer* relay_dfb_ = nullptr;
     alignas(DataflowBuffer) unsigned char relay_dfb_storage_[sizeof(DataflowBuffer)];
     uint16_t relay_entries_acked_checkpoint_ = 0;
+    // Relay pages per pipe entry, set by bind_relay() and refreshed by set_receiver_entry_size().
+    // 1 when the relay is paged at the entry size.
+    uint16_t relay_pages_per_entry_ = 1;
 
+    // A relay may page an entry more finely than delivery does (a tile-paged circular buffer under a
+    // K-block entry), so one popped entry is this many relay pages of consumer credit. The relay
+    // keeps its own page size through both align helpers; on DM, CB units are bytes.
+    FORCE_INLINE static uint16_t relay_pages_per_entry(const CrossNodeReceiverDFBInterface& iface) {
+        const uint32_t relay_page_size = get_local_cb_interface(iface.relay_id).fifo_page_size;
+        ASSERT(relay_page_size != 0);
+        ASSERT(iface.fifo_page_size % relay_page_size == 0);
+        return static_cast<uint16_t>(iface.fifo_page_size / relay_page_size);
+    }
+
+    // Wait until the consumer has popped the relay pages backing `num_entries` delivered entries.
+    // Counting is in relay pages, which is what the consumer's pop credits.
     FORCE_INLINE void wait_relay_consumed(uint32_t num_entries) {
-        ASSERT(num_entries <= relay_dfb_->get_local_num_entries());
+        const uint32_t num_relay_pages = num_entries * relay_pages_per_entry_;
+        ASSERT(num_relay_pages <= relay_dfb_->get_local_num_entries());
         WAYPOINT("PDCW");
         const uint16_t relay_dfb_id = relay_dfb_->get_id();
         const uintptr_t entries_acked_ptr = reinterpret_cast<uintptr_t>(get_cb_tiles_acked_ptr(relay_dfb_id));
@@ -569,8 +592,8 @@ private:
         do {
             invalidate_l1_cache();
             entries_acked = static_cast<uint16_t>(reg_read(entries_acked_ptr));
-        } while (static_cast<uint16_t>(entries_acked - relay_entries_acked_checkpoint_) < num_entries);
-        relay_entries_acked_checkpoint_ = static_cast<uint16_t>(relay_entries_acked_checkpoint_ + num_entries);
+        } while (static_cast<uint16_t>(entries_acked - relay_entries_acked_checkpoint_) < num_relay_pages);
+        relay_entries_acked_checkpoint_ = static_cast<uint16_t>(relay_entries_acked_checkpoint_ + num_relay_pages);
         WAYPOINT("PDCD");
     }
 

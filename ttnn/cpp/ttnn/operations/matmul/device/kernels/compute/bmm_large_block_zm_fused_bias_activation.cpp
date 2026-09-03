@@ -21,6 +21,11 @@
 #include "bmm_fused_activation.hpp"
 #endif
 
+#if defined(ENABLE_PREFETCHER_PIPE) && defined(UCK_CHLKC_UNPACK) && !defined(ARCH_QUASAR)
+#include "api/compute/common.h"
+#include "internal/prefetcher_pipe_init.h"
+#endif
+
 // Please update
 // tests/tt_metal/tt_metal/perf_microbenchmark/1_compute_mm/kernels/bmm_large_block_zm_fused_bias_activation_copy.cpp
 // when making any changes to this file.
@@ -267,6 +272,14 @@ void kernel_main() {
 
     compute_kernel_hw_startup<SrcOrder::Reverse>(in0_dfb_id, in1_dfb_id, mm_partials_dfb_id);
     matmul_block_init(in0_dfb_id, in1_dfb_id, in1_transpose_tile, out_subblock_w, out_subblock_h, in0_block_w);
+#if defined(ENABLE_PREFETCHER_PIPE) && !defined(ARCH_QUASAR)
+    // cb_in1 is a local CB laid over a PrefetcherPipe ring. That ring's read cursor is durable
+    // across programs while firmware resets the CB's pointers at every launch, so re-align to the
+    // pipe's checkpoint before the first wait_front, or the unpacker reads the wrong ring slot.
+    // Unpack only: wait_front / pop_front on cb_in1 are UNPACK-side, and no other thread addresses
+    // its pages. Runtime arg 0 is the program-local pipe id (this config sets no other compute RTA).
+    UNPACK(experimental::align_local_dfb_to_prefetcher_pipe_slot(in1_dfb_id, get_arg_val<uint32_t>(0));)
+#endif
     for (uint32_t b = 0; b < batch; b++) {
         if constexpr (get_batch_from_reader) {
             // Check whether this batch is valid

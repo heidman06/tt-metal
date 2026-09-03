@@ -1,9 +1,8 @@
 # Matmul + DRAM Prefetcher Design
 
-This document describes the contract between the gather-in0 matmul receiver
-and the two DRAM prefetcher implementations that feed it: the worker-core
-prefetcher (`ttnn.dram_prefetcher`) and the Tensor prefetcher
-(`ttnn.experimental.start_tensor_prefetcher`). It exists so that a future maintainer
+This document describes the contract between the 1D matmul receiver and the two DRAM prefetcher
+implementations that feed it: the worker-core prefetcher (`ttnn.dram_prefetcher`) and the Tensor
+prefetcher (`ttnn.experimental.start_tensor_prefetcher`). It exists so that a future maintainer
 touching either side can read one file and learn what is invariant across the
 two paths, without having to reverse-engineer the kernels.
 
@@ -415,6 +414,44 @@ requested `block_count` K-blocks and slices every block across that bank's recei
 the one exception — a per-receiver rotation is receiver-contiguous only — so a K-row-major gather
 consumer is always batched, whereas K-row-major mcast is not (its natural FIFO order needs no
 rotation).
+
+#### PrefetcherPipe delivery to mcast-in0
+
+A DRAM-sender `PrefetcherPipe` group (`TensorPrefetcherPipes`) is the second delivery transport, and
+mcast-in0 consumes it under the same block contract as the GCB: `block_count = K_tiles /
+in0_block_w`, natural FIFO order, `stream_in1=false`, one output block per receiver, one effective
+activation batch. Pass it as `prefetcher_pipes=` to `ttnn.linear` / `ttnn.matmul` (or to
+`prefetch_and_linear`, which derives the block count for both halves); `global_cb` and
+`prefetcher_pipes` are mutually exclusive.
+
+Where it differs from the GCB:
+
+- **Receiver-contiguous weights only.** A pipe sender pushes each receiver its own shard and never
+  slices a bank's shard across receivers, so the K-row-major layout is rejected.
+- **`entry_size` is exact, not a window size.** A pipe never resizes, so it must be created with
+  `entry_size == in0_block_w * per_core_N * tile_bytes` — the in1 K-block — and `num_entries >= 2`
+  for the reader's two-entry lookahead. A GCB, by contrast, is sized in bytes and floored to whole
+  pages.
+- **The in1 CB is the ring.** Rather than the GCB's paired remote `c_31` / local `c_1` CBs, the
+  factory creates one ordinary local `c_1` CB per pipe, laid over that pipe's ring at the pipe's
+  ring size and registered as the pipe's relay
+  (`tt_metal::experimental::CreateCircularBuffer(program, cores, config, pipe, pipe_id)`). Its page
+  is **one tile**, not one K-block: the unpacker addresses in1 tiles as
+  `fifo_rd_ptr + tile_index * fifo_page_size`. One delivered entry therefore publishes
+  `in1_block_num_tiles` CB pages, and `PrefetcherPipe::pop_front` waits for that many compute pops
+  before acking the sender.
+- **Both RISCs re-align at kernel entry.** The pipe's read cursor is durable across programs while
+  firmware resets a CB's pointers every launch. The in1 reader re-aligns via
+  `PrefetcherPipe::bind_relay()`; the compute kernel re-aligns explicitly under
+  `ENABLE_PREFETCHER_PIPE` with `align_local_dfb_to_prefetcher_pipe_slot(cb_in1, pipe_id)`, taking
+  the pipe id from compute runtime arg 0 (the in1 reader takes it as its last runtime arg).
+- **Publish exactly once.** The reader publishes each block through the in1 CB (`dfb_in1.push_back`)
+  and never through the relay view `bind_relay()` returns; doing both would hand compute twice the
+  credit for the same bytes.
+- **Lifetime.** The Program holds a non-owning pointer to each pipe and the in1 CB address is the
+  pipe's ring, so the pipes must outlive any cached program built against them. They must also be
+  created before any op seals the receiver cores' persistent L1 arena — under ttnn's program cache a
+  cached op keeps its Program, and its seal, alive.
 
 #### Fit ladder (receiver-contiguous)
 
