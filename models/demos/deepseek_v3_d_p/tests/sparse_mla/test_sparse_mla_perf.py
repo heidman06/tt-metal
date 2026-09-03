@@ -40,12 +40,16 @@ CCL benchmarks (LoudBox: ~11× faster wall-clock). Two semantic notes versus the
   * Multi-chip collapse takes the **max** per-chip value for each program. Realtime-profiler records
     remain the source of individual operation duration, but they are not used to infer overlap or an
     end-to-end interval. End-to-end time is measured on the host around enqueue plus an explicit mesh
-    synchronization, so naturally overlapped device work is counted once.
+    synchronization, so naturally overlapped device work is counted once. With sparse sub-device
+    overlap enabled, realtime-profiler records can omit the concurrent top-k sub-device program; those
+    rows are explicitly labelled as incomplete diagnostics while host E2E remains complete.
 
-Each measured ``forward()`` is profiled as its own region (register callback → host timer start →
-run one forward → synchronize → host timer stop → drain profiler records). Per-forward regions
-attribute operations and host duration to each cold iteration even when cached programs reuse runtime
-IDs. The run total is the sum of the per-forward host durations.
+Each measured ``forward()`` is compiled, captured as segmented traces around the sparse-overlap
+sub-device-manager boundaries, replay-warmed once, then profiled as its own region (register callback →
+host timer start → replay the complete segmented forward → synchronize → host timer stop → drain
+profiler records). Host E2E for traced execution is the primary metric. Per-forward regions attribute
+operations and host duration to each cold iteration even when cached programs reuse runtime IDs. The run
+total is the sum of the per-forward host durations; per-program device durations are secondary diagnostics.
 
 Single test (was a two-test tracy driver+impl split):
   * test_mla_chunked_perf — parametrized over [deepseek_v32, glm_5_1, glm_5_2] × [warm, cold, long] ×
@@ -137,6 +141,7 @@ from models.demos.deepseek_v3_d_p.tt.mla.rope import RotarySetup
 from models.demos.deepseek_v3_d_p.tt.moe.init_helpers import create_fabric_router_config, get_max_payload_size
 from models.demos.deepseek_v3_d_p.tt.tt_ccl import per_axis_topology
 from models.demos.deepseek_v3_d_p.utils.kv_cache_utils import MlaKvCacheFormat, init_kvpe_cache, init_mla_kv_cache
+from models.demos.deepseek_v3_d_p.utils.sub_device_trace import SubDeviceTraceController
 from models.demos.deepseek_v3_d_p.utils.test_utils import WH_WORKER_L1_SIZE
 from tests.ttnn.profiling.realtime_profiler_utils import profile_realtime_program
 
@@ -321,8 +326,9 @@ def _write_run_manifest(report_dir, *, variant, scenario, attn_mode, cache_forma
         )
         head = _git_head()
         manifest = {
-            "schema_version": 3,
+            "schema_version": 4,
             "profiler": "realtime",
+            "execution": "segmented_trace_replay",
             "variant": variant,
             "scenario": scenario,
             "attn_mode": attn_mode,
@@ -592,6 +598,57 @@ def _profile_forward(mesh_device, run_fn) -> dict:
     return {"programs": per_program, "host_duration_ns": host_duration_ns}
 
 
+def _profile_traced_forward(mesh_device, mla, run_fn) -> dict:
+    """Compile, capture, warm, then measure one complete segmented trace replay.
+
+    The controller splits capture around sparse MLA's overlap-manager load/clear boundaries. Replay
+    executes those trace segments and manager actions in order, with one final device synchronization;
+    the measured host duration is therefore the production-style traced forward E2E.
+    """
+    controller = SubDeviceTraceController(mesh_device)
+    capture_out = None
+    compile_out = None
+    capture_started = False
+    capture_ended = False
+    mla.set_trace_controller(controller)
+    try:
+        compile_out = run_fn()
+        ttnn.synchronize_device(mesh_device)
+        ttnn.deallocate(compile_out)
+        compile_out = None
+
+        controller.begin_capture()
+        capture_started = True
+        capture_out = run_fn()
+        controller.end_capture()
+        capture_ended = True
+        ttnn.synchronize_device(mesh_device)
+
+        # Exclude first-replay jitter, and drain its asynchronous realtime-profiler records before
+        # registering the measured callback. The controller performs the final synchronization, so
+        # _profile_forward's additional sync is an already-drained no-op.
+        _profile_forward(mesh_device, controller.replay)
+        measured = _profile_forward(mesh_device, controller.replay)
+        measured["trace_segments"] = controller.num_segments
+        return measured
+    finally:
+        if capture_started and not capture_ended:
+            try:
+                controller.end_capture()
+            except Exception:
+                pass
+        # A segmented replay always ends on the default manager. Release each trace while walking the
+        # same manager program so manager-owned trace buffers are resolved under their capture manager.
+        try:
+            controller.release()
+        finally:
+            mla.set_trace_controller(None)
+            if capture_out is not None:
+                ttnn.deallocate(capture_out)
+            if compile_out is not None:
+                ttnn.deallocate(compile_out)
+
+
 def _programs_to_frame(forward: dict, dur_col: str) -> pd.DataFrame:
     """One row per device program with its max-per-chip realtime-profiler duration."""
     per_program = forward["programs"]
@@ -778,9 +835,9 @@ def test_mla_chunked_perf(mesh_device, variant, scenario, attn_mode, kv_cache_fo
     )
 
     # cold: forward every chunk start=0,chunk,…,cache (the last, start=cache, is the warm step). warm/long:
-    # one forward at start=cache. Each forward is profiled as its OWN realtime-profiler region: a cached op
-    # reuses its runtime_id across forwards, so per-forward regions are what make the cold per-iteration
-    # sum correct (and replace the old signposted-region split).
+    # one forward at start=cache. Each forward is independently compiled/captured/replay-warmed, then its
+    # complete segmented trace replay is profiled in its OWN realtime-profiler region. A cached op reuses
+    # its runtime_id across forwards, so per-forward regions make the cold per-iteration sum correct.
     starts = list(range(0, cache + chunk, chunk)) if is_cold else [cache]
     logger.info(
         f"profiling {workload.system_name} {_profile_case_id(attn_mode, kv_cache_format)}/{scenario} proxy: "
@@ -796,21 +853,12 @@ def test_mla_chunked_perf(mesh_device, variant, scenario, attn_mode, kv_cache_fo
     )
 
     def _one_forward(start):
-        out = mla.forward(tt_x, rope, kvpe_cache, actual_start=start, index_kv_cache=index_kv_cache)
-        ttnn.deallocate(out)
-
-    # warm/long are steady-state measurements. Compile the exact full-grid and split-subdevice
-    # structural hashes before opening the profiler window; otherwise the host-side TopK cache miss can
-    # delay the following gather dispatch until TopK has already completed, falsely reporting no device
-    # overlap. cold intentionally retains its first-use behavior across the complete chunk loop.
-    if not is_cold:
-        _one_forward(starts[0])
-        ttnn.synchronize_device(mesh_device)
+        return mla.forward(tt_x, rope, kvpe_cache, actual_start=start, index_kv_cache=index_kv_cache)
 
     forwards = []  # per-forward host e2e duration plus max-per-chip device duration for each program
     for start in starts:
         ttnn.synchronize_device(mesh_device)  # drain prior programs so only this forward contributes records
-        forwards.append(_profile_forward(mesh_device, lambda start=start: _one_forward(start)))
+        forwards.append(_profile_traced_forward(mesh_device, mla, lambda start=start: _one_forward(start)))
 
     dur_col = "DEVICE KERNEL DURATION [ns]"  # realtime-profiler op duration; kept for downstream compatibility
     frame = pd.concat([_programs_to_frame(forward, dur_col) for forward in forwards], ignore_index=True)
@@ -818,6 +866,7 @@ def test_mla_chunked_perf(mesh_device, variant, scenario, attn_mode, kv_cache_fo
 
     wall_ns = sum(forward["host_duration_ns"] for forward in forwards)
     by_op = _by_op(frame, dur_col)
+    overlap_active = getattr(mla, "_sparse_mla_overlap", None) is not None
 
     # Manual formatting (pandas to_string can truncate long tables) — print every op.
     header = f"{'OP CODE':<44}{'count':>7}{'device_ms':>15}{'avg_us':>12}"
@@ -834,9 +883,17 @@ def test_mla_chunked_perf(mesh_device, variant, scenario, attn_mode, kv_cache_fo
             f"Galaxy target: {CHUNK_TOKENS}-tok chunk @ {galaxy_cache}-tok cache, SP={GALAXY_SP}×TP={GALAXY_TP}; "
             f"local chunk={CHUNK_TOKENS // GALAXY_SP}, local MLA heads={workload.num_attention_heads // GALAXY_TP}",
             f"host end-to-end time over the {'prefill' if is_cold else 'chunk'} "
-            f"(enqueue through device synchronization): {wall_ns/1e6:.3f} ms; "
-            f"{int(by_op['count'].sum())} device programs",
+            f"(segmented trace replay through device synchronization): {wall_ns/1e6:.3f} ms; "
+            f"{int(by_op['count'].sum())} RT-observed device programs",
             "(OP CODE = tracy-style op code mapped from kernel sources; see module docstring)",
+            *(
+                [
+                    "NOTE: per-program RT diagnostics are incomplete with sparse sub-device overlap "
+                    "(the concurrent top-k program may be omitted); host E2E above is complete."
+                ]
+                if overlap_active
+                else []
+            ),
             header,
             "-" * len(header),
             *rows,
@@ -857,6 +914,7 @@ def test_mla_chunked_perf(mesh_device, variant, scenario, attn_mode, kv_cache_fo
                 "scenario": scenario,
                 "HOST E2E DURATION [ns]": wall_ns,
                 "forward_count": len(forwards),
+                "rt_program_records_complete": not overlap_active,
             }
         ]
     ).to_csv(e2e_csv, index=False)
