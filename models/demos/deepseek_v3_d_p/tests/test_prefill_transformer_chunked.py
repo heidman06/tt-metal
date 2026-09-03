@@ -208,26 +208,31 @@ KIMI_TRACED_BASELINE_CHUNK_TIMES_S = {
     # with the first two shared-expert matmuls on sub-device 1 (234 us + 155 us), against zero
     # intersecting pairs before the change.
     #
-    # Worth 5.2% here (7.560 -> 7.168 s over the 11 chunks) and the saving is device-side, so it lands
-    # in this table and nowhere else -- the untraced twin is host-dispatch bound and does not move.
+    # Worth 5.2% on the box that measured it (7.560 -> 7.168 s over the 11 chunks); against the
+    # superseded table the realized saving is 2.0% (7.358 -> 7.213 s), the difference being box
+    # spread rather than a smaller win. It is device-side, so it lands in this table and nowhere
+    # else -- the untraced twin is host-dispatch bound and does not move.
     # The A/B that isolates it: with the overlap DISABLED the same reorder is inert (7.601 vs 7.600 s),
     # so the gain is the overlap finally engaging, not a side effect of moving the calls.
     #
-    # Per-chunk medians of one 8x4 galaxy run (2026-09-02, main + reorder) verbatim. ONE run, so
-    # cross-check the next green one; per-chunk stddev was 0.000-0.003 s, and every chunk sat below
-    # the superseded band by more than the 3% margin.
+    # Per-chunk MIDPOINT of two independent 8x4 galaxy runs (2026-09-02 bring-up; CI run 33642820055
+    # job 100584896788), not either run verbatim. The two agree to 0.2% on chunks 0-4 and diverge
+    # progressively to 2.6% by chunk 10, i.e. the gap scales with KV length and so lives in the
+    # attention ramp -- a MoE-side change shifts every chunk by the same absolute amount, this does
+    # not. Centering between them leaves >=1.7% headroom on chunk 10; either run taken verbatim
+    # leaves ~0.5% and flakes. Per-chunk stddev within a run is 0.000-0.003 s.
     (61, 11, 10): [
-        0.507,
+        0.508,
         0.510,
         0.558,
-        0.585,
-        0.619,
-        0.652,
-        0.667,
-        0.703,
-        0.754,
-        0.788,
-        0.825,
+        0.586,
+        0.620,
+        0.654,
+        0.671,
+        0.710,
+        0.762,
+        0.798,
+        0.836,
     ],
 }
 KIMI_UNTRACED_BASELINE_CHUNK_TIMES_S = {
